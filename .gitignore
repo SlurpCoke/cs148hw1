@@ -161,3 +161,22 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# Data and model files
+data/
+runs/
+plots/
+*.npy
+*.pt
+*.pth
+*.ckpt
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# OS
+.DS_Store

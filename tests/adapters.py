@@ -27,7 +27,10 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import Linear
+    layer = Linear(d_in, d_out)
+    layer.weight.data = weights
+    return layer(in_features)
 
 
 def run_embedding(
@@ -48,7 +51,10 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import Embedding
+    layer = Embedding(vocab_size, d_model)
+    layer.weight.data = weights
+    return layer(token_ids)
 
 
 def run_ffn(
@@ -77,7 +83,11 @@ def run_ffn(
     # You can also manually assign the weights
     # ffn.fc1.weight.data = w1_weight
     # ffn.fc2.weight.data = w2_weight
-    raise NotImplementedError
+    from eecs148b_hw1.model import FFN
+    layer = FFN(d_model, d_ff)
+    layer.fc1.weight.data = w1_weight
+    layer.fc2.weight.data = w2_weight
+    return layer(in_features)
 
 
 def run_layernorm(
@@ -100,7 +110,11 @@ def run_layernorm(
     Returns:
         Float[Tensor, "... d_model"]: Tensor with the output of running LayerNorm on `in_features`.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import LayerNorm
+    layer = LayerNorm(d_model, eps=eps)
+    layer.weight.data = weight
+    layer.bias.data = bias
+    return layer(in_features)
 
 
 def run_sinusoidal_pe(
@@ -109,7 +123,9 @@ def run_sinusoidal_pe(
     token_positions: Int[Tensor, " ... sequence_length"],
 ) -> Float[Tensor, " ... sequence_length d_model"]:
     """Return sinusoidal positional embeddings for the given token positions."""
-    raise NotImplementedError
+    from eecs148b_hw1.model import SinusoidalPositionalEncoding
+    layer = SinusoidalPositionalEncoding(d_model, max_seq_len)
+    return layer(token_positions)
 
 
 def run_scaled_dot_product_attention(
@@ -130,7 +146,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import scaled_dot_product_attention
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -164,7 +181,13 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import MultiHeadSelfAttention
+    layer = MultiHeadSelfAttention(d_model, num_heads)
+    layer.q_proj.weight.data = q_proj_weight
+    layer.k_proj.weight.data = k_proj_weight
+    layer.v_proj.weight.data = v_proj_weight
+    layer.output_proj.weight.data = o_proj_weight
+    return layer(in_features)
 
 
 def run_transformer_block(
@@ -233,7 +256,10 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import TransformerBlock
+    block = TransformerBlock(d_model, num_heads, d_ff)
+    block.load_state_dict(weights)
+    return block(in_features)
 
 
 def run_transformer_lm(
@@ -317,7 +343,10 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import TransformerLM
+    model = TransformerLM(vocab_size, context_length, d_model, num_layers, num_heads, d_ff)
+    model.load_state_dict(weights)
+    return model(in_indices)
 
 
 def run_get_batch(
@@ -340,7 +369,12 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    import numpy as np
+    max_start = len(dataset) - context_length
+    starts = np.random.randint(0, max_start, size=batch_size)
+    x = np.stack([dataset[s : s + context_length] for s in starts])
+    y = np.stack([dataset[s + 1 : s + context_length + 1] for s in starts])
+    return torch.from_numpy(x).long().to(device), torch.from_numpy(y).long().to(device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -356,7 +390,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.model import softmax
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(
@@ -374,7 +409,11 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    max_vals = inputs.max(dim=-1, keepdim=True).values
+    shifted = inputs - max_vals
+    log_sum_exp = torch.log(torch.exp(shifted).sum(dim=-1)) + max_vals.squeeze(-1)
+    target_logits = inputs[torch.arange(inputs.shape[0]), targets]
+    return (log_sum_exp - target_logits).mean()
 
 
 def get_tokenizer(
@@ -397,7 +436,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.tokenizer import Tokenizer
+    return Tokenizer(vocab=vocab, merges=merges, special_tokens=special_tokens)
 
 
 def run_train_bpe(
@@ -427,4 +467,5 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    from eecs148b_hw1.tokenizer import train_bpe
+    return train_bpe(input_path=input_path, vocab_size=vocab_size, special_tokens=special_tokens)

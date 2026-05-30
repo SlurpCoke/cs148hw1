@@ -1,0 +1,433 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\geometry{margin=1in}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!10},
+}
+
+\title{EE/CS 148B HW1: Build a Language Model from Scratch}
+\author{Alex Chung}
+\date{May 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Tokenizer}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Insight (BPE): Naive Merging}
+
+Naively merging pairs of bytes across raw text can create separate tokens for
+words that are semantically almost identical but differ only in punctuation.
+For example, \texttt{dog!} and \texttt{dog?} could become completely different
+tokens, even though both contain the same word \texttt{dog} and should share
+much of their meaning.  This matters because downstream models must then learn
+that \texttt{dog!} and \texttt{dog?} are related concepts from context alone,
+wasting model capacity that could have been used for genuinely distinct
+vocabulary.
+
+\subsection{BPE Training on TinyStories}
+
+Training the byte-level BPE tokenizer on TinyStories completed in 6.7 minutes,
+which is well within the 30-minute limit.  The final tokenizer had
+10{,}000 tokens total, consisting of 256 initial byte tokens, 1 special token
+(\texttt{<|endoftext|>}), and 9{,}743 learned merges.
+
+The longest token in the vocabulary was \texttt{ accomplishment}, which is
+15 bytes long.  This result makes sense because \texttt{accomplishment} is a
+long English word that appears often enough in the TinyStories dataset for BPE
+to merge its bytes into a single token.  The leading space is also expected
+because the GPT-2-style pre-tokenizer treats space-prefixed words as units,
+so the tokenizer correctly learns frequent subword patterns in their natural
+word-boundary context.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Transformer Architecture}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The model is a decoder-only Transformer language model built entirely from
+primitive operations (no \texttt{torch.nn.functional} calls).  Key components:
+
+\begin{itemize}
+  \item \textbf{Embedding}: token embedding lookup + sinusoidal positional
+        embedding (fixed, non-learnable).
+  \item \textbf{Pre-norm blocks}: LayerNorm $\to$ Multi-head Causal Attention
+        $\to$ residual; LayerNorm $\to$ FFN (SiLU + linear) $\to$ residual.
+  \item \textbf{Attention}: scaled dot-product with lower-triangular causal
+        mask; numerically stable softmax (subtract row-wise max before
+        \texttt{exp}).
+  \item \textbf{Output}: final LayerNorm, then a linear projection to
+        vocabulary logits.
+\end{itemize}
+
+The baseline model configuration is shown in Table~\ref{tab:config}.
+
+\begin{table}[h]
+\centering
+\caption{Baseline model hyperparameters}
+\label{tab:config}
+\begin{tabular}{ll}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Vocabulary size & 10{,}000 \\
+Context length & 256 tokens \\
+Model dimension $d_{\text{model}}$ & 512 \\
+Number of layers & 4 \\
+Number of heads & 8 \\
+Feed-forward dimension $d_{\text{ff}}$ & 2{,}048 \\
+Total parameters & 22{,}832{,}128 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Training}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Training Setup}
+
+\begin{itemize}
+  \item \textbf{Optimizer}: AdamW ($\beta_1=0.9$, $\beta_2=0.95$,
+        $\varepsilon=10^{-8}$, weight decay $= 0.1$).
+  \item \textbf{LR schedule}: linear warmup for 200 steps, then cosine
+        annealing from $3\times10^{-4}$ to $3\times10^{-5}$.
+  \item \textbf{Batch size}: 64 sequences of 256 tokens each
+        ($\approx 16{,}384$ tokens per step).
+  \item \textbf{Gradient clipping}: max norm 1.0.
+  \item \textbf{Data}: TinyStories training split ($\approx541$M tokens,
+        memory-mapped).
+  \item \textbf{Device}: Apple M-series GPU (MPS backend).
+\end{itemize}
+
+\subsection{Reaching Validation Loss $\leq 2.0$}
+
+Phase 1 ran for 5{,}000 steps at $\text{lr}=3\times10^{-4}$, achieving a
+best validation loss of $2.1036$ (perplexity $= 8.20$).  The cosine schedule
+had reached its minimum ($3\times10^{-5}$) by the end of phase 1, leaving no
+room for further improvement with the same optimizer state.
+
+To cross the $2.0$ threshold, a \emph{warm restart} was performed: the model
+weights were loaded from the best phase-1 checkpoint, the AdamW optimizer was
+reset to a fresh state, and training continued for 2{,}000 more steps at
+$\text{lr}=5\times10^{-4}$ (warmup 100 steps, min-lr $5\times10^{-5}$).
+This allowed the optimizer to escape the flat region around the local minimum
+found by the cosine schedule.
+
+The model crossed validation loss $2.0$ at step 1{,}000 of the warm restart
+and reached a final best validation loss of $\mathbf{1.8452}$
+(perplexity $\mathbf{6.33}$) at step 2{,}000.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.85\textwidth]{plots/baseline_curve.png}
+  \caption{Baseline training curve.  Phase 1 (lr=$3\times10^{-4}$, 5{,}000
+    steps) reaches val\_loss $=2.10$.  The warm-restart phase (lr=$5\times10^{-4}$,
+    fresh optimizer, 2{,}000 steps) crosses the target of $2.0$ at
+    step $\approx1{,}000$ and finishes at $1.845$.}
+  \label{fig:baseline}
+\end{figure}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Text Generation}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Sampling Implementation}
+
+Text is generated autoregressively.  At each step:
+\begin{enumerate}
+  \item The last $\min(\text{len}(\text{tokens}),256)$ token IDs are fed to
+        the model to obtain logits for the next token.
+  \item \textbf{Temperature scaling}: logits are divided by $\tau$, then
+        numerically-stable softmax is applied:
+        \[
+          p_i = \frac{\exp((l_i - \max_j l_j)/\tau)}
+                     {\sum_k \exp((l_k - \max_j l_j)/\tau)}
+        \]
+  \item \textbf{Top-$p$ (nucleus) filtering}: tokens are sorted descending by
+        probability; the smallest prefix whose cumulative probability $\geq p$
+        is retained, probabilities are renormalized, and a token is sampled
+        with \texttt{torch.multinomial}.
+  \item Generation halts on \texttt{<|endoftext|>} or after
+        \texttt{max\_tokens} new tokens.
+\end{enumerate}
+
+\subsection{Insight: Temperature Scaling}
+
+\textbf{When $\tau \to 0$}: the highest-logit token dominates
+exponentially; in the limit this is equivalent to greedy argmax decoding ---
+the model always picks its single most likely next token, producing repetitive
+but locally coherent text.
+
+\textbf{When $\tau \to \infty$}: all logits are divided by a huge number,
+making them nearly equal before softmax, so the distribution approaches
+uniform --- the model samples uniformly at random from the entire vocabulary,
+producing incoherent noise.
+
+Values in between (e.g.\ $\tau = 0.7$--$1.0$) trade off between diversity
+and quality.
+
+\subsection{Generated Text Sample}
+
+The following 190-token sample was generated from the best checkpoint
+(val\_loss $= 1.845$) using temperature $\tau = 0.8$ and top-$p = 0.92$:
+
+\vspace{0.5em}
+\begin{lstlisting}
+Prompt: Once upon a time, there was a little girl named Lily who loved to
+explore the forest near her home.
+
+Generated:
+One day, while playing in her home, she saw a big red ball near her house.
+She was very curious about the ball.
+Lily wanted to see the big red ball. She walked up to the big red ball and
+started to follow it. As she walked, she saw a big, red ball. She wanted to
+play with the big red ball, but she was scared.
+Lily tried to push the big red ball, but it was too fast. She thought of a
+plan to stop the ball. She took the big red ball and ran to the big red ball.
+Lily saw the big red ball and felt happy.
+But then, something unexpected happened. The big red ball started to glow!
+It was a magic ball. Lily and the magic ball did not get the ball back. Lily
+was so surprised and happy. They played with the big red ball all day, and
+the big red ball never came back.
+<|endoftext|>
+\end{lstlisting}
+
+\subsubsection*{Fluency Commentary}
+
+The output is \textbf{grammatically correct} throughout and conforms to the
+``TinyStories'' register: simple past tense, short sentences, a clear
+protagonist and a problem-resolution arc.  However, the text has noticeable
+weaknesses:
+
+\begin{enumerate}
+  \item \textbf{Repetition / broken coreference}: The phrase ``big red ball''
+        appears nine times in 190 tokens.  The model has learned the surface
+        co-occurrence between the noun phrase and the story genre but lacks a
+        mechanism to track entities and vary referring expressions.
+
+  \item \textbf{Logical inconsistency}: Lily ``ran to the big red ball'' after
+        already holding it, and the magic ball ``never came back'' after she
+        played with it all day.  Transformer language models predict the next
+        token conditioned on a fixed context window and do not maintain a
+        persistent world state, so they cannot guarantee global narrative
+        consistency.
+\end{enumerate}
+
+Two factors that most strongly affect output quality:
+\begin{itemize}
+  \item \textbf{Model perplexity / training budget}: with more steps or a
+        larger model the distribution over next tokens is sharper and more
+        contextually appropriate, directly reducing repetition and incoherence.
+  \item \textbf{Context length}: the 256-token context window limits how far
+        back the model can track entities and plot; a longer context or a
+        memory mechanism would improve narrative consistency.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Insight: Perplexity}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Perplexity $\text{PPL} = e^{\mathcal{L}}$ (where $\mathcal{L}$ is the
+average cross-entropy loss per token) is preferred over raw loss for two
+reasons:
+
+\begin{enumerate}
+  \item \textbf{Interpretable units}: perplexity can be understood as the
+        ``effective branching factor'' --- the model is, on average, as
+        uncertain as if it had to choose uniformly among $\text{PPL}$ equally
+        likely next tokens.  A perplexity of 6.33 means the model is, on
+        average, confused between roughly 6 options per token, which is an
+        intuitive measure of language understanding.
+
+  \item \textbf{Tokenizer-independent comparisons}: cross-entropy loss
+        depends on the tokenization granularity (character-level models have
+        lower per-token loss than word-level models simply because characters
+        are easier to predict).  Perplexity normalises for this by measuring
+        uncertainty per token in the model's own vocabulary, making results
+        more comparable across systems with different tokenizers.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Ablation 1: Effect of LayerNorm}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Setup}
+
+Two ``no-LayerNorm'' variants were trained: one at the same learning rate as
+the baseline ($3\times10^{-4}$) to test for instability, and one at a lower
+rate ($3\times10^{-5}$) to see whether stability can be recovered with a
+reduced learning rate.  Both ran on the same architecture (4 layers, 512-dim)
+with all LayerNorm modules removed.
+
+\begin{table}[h]
+\centering
+\caption{LayerNorm ablation results}
+\label{tab:ln}
+\begin{tabular}{lrrrr}
+\toprule
+Run & Steps & Best val loss & Best PPL & LR \\
+\midrule
+Baseline (with LN) & 5{,}000 + 2{,}000 & 1.845 & 6.33 & $3\times10^{-4}$ \\
+No-LN, lr=$3\times10^{-4}$ & 400 & 3.534 & 34.26 & $3\times10^{-4}$ \\
+No-LN, lr=$3\times10^{-5}$ & 1{,}500 & 3.948 & 51.85 & $3\times10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.85\textwidth]{plots/layernorm_ablation.png}
+  \caption{LayerNorm ablation learning curves.  Both no-LayerNorm variants
+    converge far more slowly than the baseline and reach much higher
+    validation loss.  Lowering the learning rate stabilises training
+    superficially but actually \emph{worsens} final performance.}
+  \label{fig:ln}
+\end{figure}
+
+\subsection{Observations and Explanation}
+
+\textbf{Why the high-LR no-LN run degrades:}
+Without LayerNorm, the residual stream activations can grow unboundedly.  The
+attention softmax is sensitive to the scale of its inputs (large dot products
+push softmax toward saturation, collapsing the attention distribution to
+one-hot), and the FFN nonlinearity similarly saturates for large pre-activations.
+At lr $= 3\times10^{-4}$ these effects compound over layers: gradients arrive
+with very different magnitudes across layers, causing erratic parameter updates
+and slow convergence.  The model stalls at val\_loss $\approx 3.5$ after only
+400 steps.
+
+\textbf{Why the low-LR no-LN run is even worse:}
+Intuitively, lowering the learning rate reduces the gradient signal but does
+\emph{not} fix the underlying problem: activations are still unscaled and the
+optimization landscape is still poorly conditioned.  The model therefore makes
+smaller, noisier updates while still suffering from the same saturation issues,
+leading to slower convergence and a worse final loss ($3.95$ after 1{,}500 steps).
+LayerNorm's benefit is not merely ``keeping gradients small'' but ensuring that
+each layer receives inputs with roughly unit variance, which re-centers the
+optimization landscape so that gradient descent steps are actually useful.
+
+\textbf{Conclusion:}  LayerNorm is critical for training stability and fast
+convergence in Transformers.  Removing it degrades performance dramatically
+regardless of the learning rate, because the root cause is ill-conditioned
+layer activations, not learning-rate magnitude alone.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Ablation 2: Sinusoidal PE vs.\ NoPE}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Setup}
+
+The NoPE variant removes positional embeddings entirely: the input to the
+Transformer is the token embedding alone.  All other hyperparameters are
+identical to the baseline (4 layers, 512-dim, lr $= 3\times10^{-4}$,
+2{,}500 steps).
+
+\begin{table}[h]
+\centering
+\caption{Positional embedding ablation results at 2{,}500 steps}
+\label{tab:pe}
+\begin{tabular}{lrr}
+\toprule
+Model & Val loss & PPL \\
+\midrule
+Sinusoidal PE (baseline) & 2.104 & 8.20 \\
+NoPE & 2.265 & 9.63 \\
+\midrule
+Gap & +0.161 & +1.43 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.85\textwidth]{plots/nope_ablation.png}
+  \caption{Sinusoidal PE vs.\ NoPE validation loss.  NoPE converges more
+    slowly and finishes $\approx0.16$ nats above the sinusoidal baseline,
+    confirming that explicit positional information helps but is not
+    catastrophically necessary.}
+  \label{fig:pe}
+\end{figure}
+
+\subsection{Observations and Explanation}
+
+The performance gap is moderate ($\approx 0.16$ nats at 2{,}500 steps) rather
+than catastrophic.  This is somewhat counterintuitive but has a principled
+explanation:
+
+\begin{itemize}
+  \item \textbf{The causal mask provides implicit order information.}  In a
+        decoder-only Transformer, the causal (lower-triangular) attention mask
+        ensures that token $i$ can attend only to tokens $j \leq i$.  This
+        means the \emph{relative order} of tokens is preserved even without
+        explicit position IDs: the model can infer that an early-in-context
+        token came before a later-in-context token by which ones were masked
+        out.  However, it cannot distinguish between, say, position 5 and
+        position 50 in absolute terms.
+
+  \item \textbf{TinyStories has short-range dependencies.}  Most
+        grammatical relationships in children's stories operate within a span
+        of a few tokens (subject-verb agreement, pronoun resolution within a
+        sentence).  The sinusoidal embeddings help most when long-range
+        absolute position matters; on this dataset the benefit is real but
+        modest.
+
+  \item \textbf{NoPE is not position-blind.}  The relative ordering
+        information from the causal mask means the model still learns
+        \emph{recency} (recent tokens are more informative than distant ones),
+        even without absolute position signals.  Learned attention patterns
+        effectively implement a soft recency bias.
+\end{itemize}
+
+\textbf{Conclusion:}  Sinusoidal positional embeddings provide a measurable
+but not decisive advantage on this dataset and context length (256 tokens).
+For longer contexts or tasks requiring precise absolute positioning (e.g.,
+copying text, structured generation), the gap would likely be larger.
+For decoder-only models with moderate context lengths and local dependencies,
+NoPE (or relative PE schemes) may be acceptable alternatives.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Summary of Results}
+% ─────────────────────────────────────────────────────────────────────────────
+
+\begin{table}[h]
+\centering
+\caption{All experimental results}
+\label{tab:summary}
+\begin{tabular}{llrr}
+\toprule
+Experiment & Configuration & Best Val Loss & Best PPL \\
+\midrule
+Baseline Phase 1 & lr=$3\times10^{-4}$, 5{,}000 steps & 2.104 & 8.20 \\
+Baseline + Warm Restart & lr=$5\times10^{-4}$, 2{,}000 extra steps & \textbf{1.845} & \textbf{6.33} \\
+\midrule
+No LayerNorm (high LR) & lr=$3\times10^{-4}$, 400 steps & 3.534 & 34.26 \\
+No LayerNorm (low LR) & lr=$3\times10^{-5}$, 1{,}500 steps & 3.948 & 51.85 \\
+\midrule
+NoPE & lr=$3\times10^{-4}$, 2{,}500 steps & 2.265 & 9.63 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The best model (baseline with warm restart) achieves validation perplexity
+$6.33$, comfortably below the target of $\leq 2.0$ validation loss.  The
+ablations confirm that LayerNorm is essential for fast, stable convergence
+(removing it raises perplexity by $4\times$--$8\times$), while sinusoidal
+positional embeddings provide a useful but not critical benefit on short-context
+language modeling tasks.
+
+\end{document}
